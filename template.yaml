@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  transfer-custom-identity-provider
+
+Parameters:
+  HomeDirectoryName:
+    Description: |
+      Home directory for login users. An S3 bucket is created with the HomeDirectoryName. Each user with access must have a corresponding "subfolder" in the HomeDirectory S3 bucket. A scope down policy will limit a users access to the subfolder.
+    Type: String
+  VpcId:
+    Description: VPC ID to deploy the transfer server endpoint in
+    Type: AWS::EC2::VPC::Id
+  SubnetID1:
+    Description: Subnet to deploy transfer service to, utilize a private subnet. At least subnet 1 must be populuated
+    Type: String
+    AllowedPattern: ".+"
+  SubnetID2:
+    Description: Subnet 2 for multi-az deployment
+    Type: String
+  SubnetID3:
+    Description: Subnet 3 for multi-az deployment
+    Type: String
+  CertificateArn:
+    Description: Certificate Arn | Use only needed if FTPS protocal needs to be used
+    Type: String
+  ActiveDirectoryUrl:
+    Description: |
+      URL used to connect to Active Directory for user autheniticaiton, typically in the format ldap://
+    Type: String
+  ActiveDirectoryBaseDN:
+    Description: 
+      The Base DN (distinguished name) is the starting point used when searching for users authentication within your Directory.
+    Type: String
+
+Conditions:
+  CertificateArnNotPresent: !Equals [Ref: CertificateArn, ""]
+  Subnet2NotPresent: !Equals [Ref: SubnetID2, ""]
+  Subnet3NotPresent: !Equals [Ref: SubnetID3, ""]
+
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  TransferS3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role used by Transfer to give access to S3 bucket after user is authenticated
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - transfer.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  TransferCloudWatchLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role used by Transfer to log requests to CloudWatch
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - transfer.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AWSTransferLoggingAccess
+
+  TransferS3HomeDirectoryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref HomeDirectoryName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TransferSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: transfer-server-security-group
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 21
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8192
+          ToPort: 8200
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+
+  TransferServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      EndpointType: VPC
+      Domain: S3
+      Certificate:
+        !If [CertificateArnNotPresent, Ref: AWS::NoValue, Ref: CertificateArn]
+      Protocols:
+        - FTP
+        - !If
+          - CertificateArnNotPresent
+          - Ref: AWS::NoValue
+          - FTPS
+      EndpointDetails:
+        SubnetIds:
+          - Ref: SubnetID1
+          - !If
+            - Subnet2NotPresent
+            - Ref: AWS::NoValue
+            - Ref: SubnetID2
+          - !If
+            - Subnet3NotPresent
+            - Ref: AWS::NoValue
+            - Ref: SubnetID3
+        VpcId:
+          Ref: VpcId
+        SecurityGroupIds:
+          - Ref: TransferSecurityGroup
+      IdentityProviderDetails:
+        Function: !GetAtt AuthorizeFunction.Arn
+      IdentityProviderType: AWS_LAMBDA
+      LoggingRole: !GetAtt TransferCloudWatchLoggingRole.Arn
+
+  TransferS3AccessPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: TransferS3AccessPolicy
+      Roles:
+        - Ref: TransferS3AccessRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !GetAtt TransferS3HomeDirectoryBucket.Arn
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetObject
+              - s3:GetObjectAcl
+              - s3:GetObjectVersion
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt TransferS3HomeDirectoryBucket.Arn
+              - !Sub
+                - ${BucketARN}/*
+                - BucketARN: !GetAtt TransferS3HomeDirectoryBucket.Arn
+
+  AuthorizeFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role used for Lambda Execution Role for Authorization function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  AuthorizeFunctionExecutionPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName:
+        Fn::Sub: AuthorizeFunctionExecutionPolicy-LambdaExecutionPolicy
+      Roles:
+        - Ref: AuthorizeFunctionExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub 
+                - "arn:${AWS::Partition}:s3:::${bucketName}/*"
+                - bucketName: !Ref HomeDirectoryName
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Sub 
+                - "arn:${AWS::Partition}:s3:::${bucketName}"
+                - bucketName: !Ref HomeDirectoryName
+
+  AuthorizeFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: authorize-function-security-group
+      VpcId:
+        Ref: VpcId
+
+  AuthorizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: custom-idp/dist
+      Handler: app.authorize
+      Runtime: nodejs16.x
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          HOME_DIRECTORY_NAME: !Ref HomeDirectoryName
+          S3_ACCESS_ROLE_ARN: !GetAtt TransferS3AccessRole.Arn
+          S3_ROOT_BUCKET_ARN: !GetAtt TransferS3HomeDirectoryBucket.Arn
+          ACTIVE_DIRECTORY_URL: !Ref ActiveDirectoryUrl
+          ACTIVE_DIRECTORY_BASE_DN: !Ref ActiveDirectoryBaseDN
+      Role: !GetAtt AuthorizeFunctionExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - Ref: AuthorizeFunctionSecurityGroup
+        SubnetIds:
+          - Ref: SubnetID1
+          - !If
+            - Subnet2NotPresent
+            - Ref: AWS::NoValue
+            - Ref: SubnetID2
+          - !If
+            - Subnet3NotPresent
+            - Ref: AWS::NoValue
+            - Ref: SubnetID3
+      
+  AuthorizeFunctionPermissionToTransfer:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt AuthorizeFunction.Arn
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt TransferServer.Arn
+
+Outputs:
+  AuthorizeFunction:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt AuthorizeFunction.Arn
+    Export:
+      Name: AuthorizeFunction
+  AuthorizeFunctionIamRole:
+    Description: "Implicit IAM Role created for Authorize function"
+    Value: !GetAtt AuthorizeFunctionExecutionRole.Arn
+  TransferS3HomeDirectoryBucketName:
+    Description: S3 Bucket Access for Transfer Service Bucket Name
+    Value:
+      Ref: TransferS3HomeDirectoryBucket
+  TransferServerId:
+    Description: Transfer Server
+    Value: !GetAtt TransferServer.ServerId
+  TransferServerEndpoint:
+    Description: Transfer Server
+    Value: !GetAtt TransferServer.ServerId

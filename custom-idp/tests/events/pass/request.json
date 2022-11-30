@@ -1,0 +1,7 @@
+{
+  "username": "user@domain",
+  "password": "fakepassword",
+  "protocol": "FTP",
+  "serverId": "s-abcd123456",
+  "sourceIp": "192.168.0.100"
+}
